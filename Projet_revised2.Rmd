@@ -1,0 +1,1292 @@
+---
+title: "Analyse statistique et structurale des cavités protéiques : de la classification à la prédiction de la druggabilité"
+author: "Anna Perova"
+date: "2026-01-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+required_packages <- c("FactoMineR","factoextra","corrplot","gplots","pheatmap","caret","pROC","fmsb","rpart","MASS","rpart.plot","randomForest", "dplyr")
+lapply(required_packages, require, character.only = TRUE)
+path <- file.path("D:", "academia", "ISDD", "IA", fsep="/")
+setwd(path)
+```
+
+# Introduction
+
+Objectif de ce projet:
+
+1.  identifier les propriétés spécifiques des poches druggables
+2.  développer un modèle statistique pour prédire la druggabilité de la
+    poche en fonction de ses propriétés
+
+Info sur dataset:
+L'ensemble de données a été extrait du jeu de données de Krasowski et contient 112 poches :
+- 71 poches druggables,
+- 41 poches moins druggables.
+
+Decrit selon 27 variables:
+-   descripteurs de quantification de la géométrie de la poche, Xgeom :
+    Real_volume, Mean_alpha.sphere_radius;
+-   descripteurs de quantification de la composition en acides aminés
+    des poches, XPC : fréquences des 20 acides aminés;
+-   drugg = le type de druggabilité de chaque poche : 1 = druggable, 0 =
+    moins druggable (Col 28);
+-   score = score de druggabilité (Col 29).
+
+#Partie 0. Exploration et Description des Données
+
+##Preparation des données
+
+```{r load data}
+file <- read.table("descriptor_pocket.mat")
+file$drugg <- as.factor(file$drugg)
+```
+
+```{r study data, results='hide'}
+glimpse(file)
+dim(file)
+file_na <- na.omit(file)
+dim(file_na)
+```
+
+Le jeu de données final doit comprendre uniquement (18 variables):
+• des descripteurs physico-chimiques : X_PC
+• des descripteurs géométriques : X_geom
+• les variables à prédire drugg et score
+
+```{r aa classes}
+aromatiques <- c("F", "Y", "H", "W")
+polaires    <- c("C", "D", "E", "H", "K", "N", "Q", "R", "S", "T", "W", "Y")
+aliphatiques <- c("I", "L", "V")
+charges      <- c("D", "E", "R", "K", "H")
+negatifs     <- c("D", "E")
+positifs     <- c("H", "K", "R")
+hydrophobes  <- c("C", "G", "A", "T", "V", "L", "I", "M", "F", "W", "Y", "H", "K")
+petits       <- c("C", "V", "T", "G", "A", "S", "D", "N", "P")
+tres_petits  <- c("A", "C", "G", "S")
+```
+
+```{r class frequencies}
+file_na$aromatiques  <- apply(file_na[, aromatiques], 1, sum)
+file_na$polaires     <- apply(file_na[, polaires], 1, sum)
+file_na$aliphatiques <- apply(file_na[, aliphatiques], 1, sum)
+file_na$charges      <- apply(file_na[, charges], 1, sum)
+file_na$negatifs     <- apply(file_na[, negatifs], 1, sum)
+file_na$positifs     <- apply(file_na[, positifs], 1, sum)
+file_na$hydrophobes  <- apply(file_na[, hydrophobes], 1, sum)
+file_na$petits       <- apply(file_na[, petits], 1, sum)
+file_na$tres_petits  <- apply(file_na[, tres_petits], 1, sum)
+
+file$aromatiques  <- apply(file[, aromatiques], 1, sum)
+file$polaires     <- apply(file[, polaires], 1, sum)
+file$aliphatiques <- apply(file[, aliphatiques], 1, sum)
+file$charges      <- apply(file[, charges], 1, sum)
+file$negatifs     <- apply(file[, negatifs], 1, sum)
+file$positifs     <- apply(file[, positifs], 1, sum)
+file$hydrophobes  <- apply(file[, hydrophobes], 1, sum)
+file$petits       <- apply(file[, petits], 1, sum)
+file$tres_petits  <- apply(file[, tres_petits], 1, sum)
+```
+
+```{r new df}
+X_geom  <- c("C_ATOM", "C_RESIDUES", "Real_volume","Mean_alpha.sphere_radius","Proportion_of_apolar_alpha_sphere",
+             "Mean_B.factor","Mean_alpha.sphere_SA")
+X_PC <- c("aromatiques","polaires",
+          "aliphatiques","charges",
+          "negatifs","positifs","hydrophobes",
+          "petits","tres_petits")
+columns <- c("drugg", "score", X_PC, X_geom)
+new_df <- data.frame(
+    drugg = file_na$drugg,
+    score = file_na$score,
+    file_na[, X_PC],
+    file_na[, X_geom]) 
+dim(new_df)
+
+data_raw <- data.frame(
+    drugg = file$drugg,
+    score = file$score,
+    file[, X_PC],
+    file[, X_geom]) 
+```
+
+```{r save new df}
+save(new_df, file = file.path(path,"new_df.Rdata"))
+columns <- c("name","drugg", "score", X_PC, X_geom)
+write.table(new_df, file = file.path(path,"new_df.csv"), row.names = TRUE,
+            col.names = NA, sep = ",")
+
+save(data_raw, file = file.path(path,"data_raw.Rdata"))
+columns <- c("name","drugg", "score", X_PC, X_geom)
+write.table(new_df, file = file.path(path,"data_raw.csv"), row.names = TRUE,
+            col.names = NA, sep = ",")
+```
+
+##Étude des corrélations et lien linéaire
+```{r}
+model_vol <- lm(Real_volume ~ C_ATOM, data = data)
+plot(data$C_ATOM, data$Real_volume, pch=19, col="darkblue")
+abline(model_vol, col="red")
+summary(model_vol)
+```
+
+```{r autocorrelation cleaning}
+corr_matrix <- cor(data_wo_drugg)
+corrplot(corr_matrix, 
+         method = "circle",     
+         type = "lower",        
+         order = "hclust",      
+         tl.col = "black",      
+         tl.srt = 45,           
+         tl.cex = 0.8,          
+         diag = FALSE)
+redundant_variables <- findCorrelation(corr_matrix, cutoff = 0.5)
+data_clean2 <- data_wo_drugg[, -redundant_variables]
+dim(data_clean2)
+save(data_clean2, file = file.path(path,"data_clean2.Rdata"))
+```
+
+```{r}
+data <- new_df
+data_wo_drugg <-data[-1]
+data_wo_score <- data[-2]
+```
+
+##Visualisation et Standardisation
+
+```{r}
+par(mfrow = c(1, 2))
+boxplot(data_clean[-c(15)], main = "Données brutes", las = 2, cex.axis = 0.7)
+data_s <- as.data.frame(scale(data_clean[-c(15)]))
+boxplot(data_s, main = "Données standardisées", las = 2, cex.axis = 0.7)
+par(mfrow = c(1, 1))
+```
+
+# Partie 1. Analyse Non-Supervisée (Clustering)
+
+Deux méthodes de classification etudié:
+
+- classification hiérarchique
+- kmeans
+
+1.  Normalisation des données: mettre les unités en échelle (centé-reduite)
+
+a.  Check the normality of dataset
+
+## Classification Ascendante Hiérarchique (CAH)
+
+Functions used here: 
+ - scale() = normalization of data
+ - dist() = distance matrix calculation
+ - hclust() = calculation of the classification tree 
+ - plot() = graphical representation of the classification tree
+ - fviz_nbclust(factoextra) = determination of the optimal number of clusters according to a chosen criterion
+ - rect.hclust() = visualization of clusters on the classification tree
+ - cutree() = cluster retrieval
+
+### Initialisation
+```{r distance matrix}
+#on scaled data! (without drugg col)
+#dist() function!
+dts.euc <- dist(data_s, method = "euclidean")
+```
+
+```{r classification tree}
+#we use scaled data; wardD2 method = minimizes the intra variability of the clusters and maximizes the inter variability (between clusters)
+
+data_s_hca <- hclust(dts.euc, method = "ward.D2")
+
+#plot the dendrogram
+plot(data_s_hca, hang = -1, cex = 0.4, main = "Dendrogramme (Données standardisées)")
+rect.hclust(data_s_hca, k = 4)
+```
+
+### Clusters observation
+
+```{r optimal nb of clusters}
+#takes into argument the data (not the dist matrx)
+#observes the evolution of intra-cluster variability as a function of the number of clusters to determine the optimal number of clusters
+#FUNcluster option = hcut
+
+fviz_nbclust(data_s,
+             hcut,
+             method = "silhouette")
+
+```
+Quel nombre de cluster allez-vous choisir ? Pourquoi ?
+
+Meme si le nombre optimal des clusters proposées par la fonction est 5, au debut il est préferable de se mettre sur un nombre des clu
+
+
+```{r clusters on dendrogram}
+#rect.hclust = adds the rectangular boxes that selec the clusters on the dendrogram
+plot(data_s_hca, hang = -1, cex = 0.4, main = "Dendrogramme (Données standardisées)")
+rect.hclust(data_s_hca, k = 3)
+```
+
+
+```{r cluster retrieval}
+#cutree() function!
+#retrieves for each individual (protein pockets) their cluster
+group_hclust <- factor(cutree(data_s_hca, k = 3))
+table(group_hclust)
+```
+
+```{r compare HCA visualisations}
+par(mfrow = c(1, 2)) 
+kk <- 3
+plot(data_s_hca, hang = -1, cex = 0.4)
+rect.hclust(data_s_hca, k = kk)
+#see mds in part 2. visualisation
+data_s_cluster <- cutree(data_s_hca, k = kk)
+plot(dts_cmds, col = dts.cluster)
+abline(h = 0, v = 0, lty = 2)
+text(dts_cmds, labels = rownames(data_s), cex = 0.5, pos = 1, col = dts.cluster)
+```
+
+## K-means method
+Kmeans create groups of homogeneous individuals (who resemble each other) but different from the individuals of other groups aka clusters
+We need an already set nb of clusters! (centers)
+
+Functions used here: 
+- kmeans() = calculation of the classification of data using the function
+- table() to output the result; or see mds for plot
+
+```{r initialisation}
+# centers = nb of clusters
+#nstart = launches n number of kmeans and looks at the best result (intra-cluster variability)
+# nstart = 50 pour la stabilité
+data.kmeans <- kmeans(data_s, centers = 4, nstart = 50)
+table(data.kmeans$cluster)
+```
+
+```{r compare nstart settings}
+#we compare unstable kclust (nstart is set to 1 by default)
+#with stable kclust (does not change with any iteration)
+
+#initialise the unstable:
+data.kmeans = kmeans(data_s, centers = 4, nstart = 1)
+kclust_instable <- data.kmeans$cluster
+
+#initialize two different stable kclust:
+data.kmeans = kmeans(data_s, centers = 4, nstart = 50)
+kclust_stable_1 <- data.kmeans$cluster
+
+data.kmeans = kmeans(data_s, centers = 4, nstart = 50)
+kclust_stable_2 <- data.kmeans$cluster
+
+#visualise the difference with table
+#addition of the values of the table in each position = the value of the table in each position;
+#just table() for each kclust is easier
+
+table(kclust_instable, kclust_stable_1)
+table(kclust_instable, kclust_stable_2)
+table(kclust_stable_1, kclust_stable_2)
+
+```
+
+```{r nb of clusters}
+#fviz_nbclust() function!
+#NbClust() function
+fviz_nbclust(data_s, FUNcluster = kmeans, method = "silhouette")
+dts.euc <- dist(data_s, method = "euclidean", diag = F)
+```
+##Interprétation des Clusters & Feature selection
+
+```{r compare two methods}
+#hclust
+kk <- 4
+par(mfrow = c(1, 2))
+#plot HCA with mds
+data_s_cluster <- cutree(data_s_hca, k = kk)
+plot(dts_cmds, main = "HClust", col = data_s_cluster)
+abline(h = 0, v = 0, lty = 2)
+text(dts_cmds, labels = rownames(data_s), cex = 0.5, pos = 1, col = dts.cluster)
+#plot Kclust with mds
+data_s_kmeans <- kmeans(data_s, centers = kk, nstart = 50)$cluster
+plot(dts_cmds, main = "Kmeans", col = data_s_kmeans)
+abline(h = 0, v = 0, lty = 2)
+text(dts_cmds, labels = rownames(data_s), cex = 0.5, pos = 1, col = data_s_kmeans)
+par(mfrow = c(1, 1))
+
+table(data_s_cluster, data_s_kmeans)
+
+#find Rand adjusted index
+
+mclust::adjustedRandIndex(data_s_cluster, data_s_kmeans)
+```
+Goal: define descriptors that provide same/similar info
+
+### Dendrogram for descriptors (with clusters)
+```{r euclidian distance bw descriptors + plot}
+#needs scaled data; checks for similar values
+tdata_dist <- dist(t(data_s))
+tdata_ward <- hclust(tdata_dist, method = "ward.D2")
+plot(tdata_ward, hang = -1, main = "Descriptor clusters (Ward)")
+```
+
+```{r correlation distance bw descriptors + plot}
+#doesn't need scaled data; focuses on overall pattern
+data_cor <- cor(data[-1])
+corrplot(data_cor)
+data_cor_dist <- 1 - data_cor^2
+data_cor_dist <- as.dist(data_cor_dist)
+data_cor_ward <- hclust(data_cor_dist, method = "ward.D2")
+plot(data_cor_ward, hang = -1, main = "Descriptor clusters (correlation)")
+```
+
+### Heatmap
+Functions used:
+heatmap
+heatmap.2(gplots); hclustfun => ward.D2
+pheatmap
+#### Pocket heatmaps 
+```{r pocket classification heatmap}
+data_mat <- as.matrix(data_s[-1])
+heatmap(data_mat, trace = "none", density.info = "none", 
+        dendrogram = "row", Colv = NA,
+        hclustfun = function(x) hclust(x, method = "ward.D2"),
+        main = "classification des poches",
+        xlab = "les descripteurs", ylab = "les poches")
+```
+
+```{r pocket heatmap2}
+data_mat <- as.matrix(data_s[-1])
+heatmap.2(data_mat, trace = "none", density.info = "none", 
+          dendrogram = "row", Colv = FALSE, Rowv = TRUE,
+          hclustfun = function(x) hclust(x, method = "ward.D2"),
+          main = "classification des poches",
+          xlab = "les descripteurs", ylab = "les poches")
+```
+
+```{r pocket pheatmap}
+pheatmap(data_mat, cluster_rows = TRUE, cluster_cols = FALSE, cutree_rows = 3,
+         clustering_method = "ward.D2", main = "classification des poches",
+         xlab = "les descripteurs", ylab = "les poches", cellwidth = 10)
+```
+
+#### Pocket + Descriptors
+
+```{r pocket+desc heatmap2}
+data_mat <- as.matrix(data_s[-1])
+heatmap.2(data_mat, trace = "none", density.info = "none",
+          dendrogram = "both",
+          hclustfun = function(x) hclust(x, method = "ward.D2"),
+          main = "classification des poches et des descripteurs",
+          xlab = "les descripteurs", ylab = "les poches")
+```
+
+
+```{r}
+
+# ANOVA for statitical test of clusters
+#data_s_anova <- data.frame(data, cut = factor(mes_groupes_hclust))
+
+
+# On utilise les groupes de la CAH pour l'exemple
+#clusters <- cutree(data_s_hca, k = 4)
+#data_anova <- data.frame(data, Cluster = factor(clusters))
+
+# Test ANOVA sur chaque variable
+#p_values <- sapply(data[, -which(names(data) == "score")], function(x) {
+#  summary(aov(x ~ data_anova$Cluster))[[1]][["Pr(>F)"]][1]
+})
+#sort(p_values[p_values < 0.05])
+```
+
+
+
+### Radarplot
+Used to compare multiple quantitative variables at once;
+Each spoke represents one variable
+The center of the wheel represents the minimum value of the data - the maximum = the outer rim
+
+```{r radar plots}
+# make a list to store the plots 
+radar_data <- list()
+# loop through every cluster
+for (i in 1:kk) {
+  cluster_data <- data_s[data_s_cluster == i, ]
+  radar_data[[i]] <- apply(cluster_data, 2, mean)
+}
+# liimits of the radarplot
+max_min <- data.frame(
+  max = apply(data_s, 2, max),
+  min = apply(data_s, 2, min)
+)
+# add limits to plots
+for (i in 1:kk) {
+  radar_data[[i]] <- data.frame(rbind(t(max_min), radar_data[[i]]))
+}
+# plot
+par(mfrow = c(1, kk))
+for (i in 1:kk) {
+  radarchart(radar_data[[i]], axistype = 1, pcol = rainbow(kk)[i], pfcol = NA, 
+             maxmin = TRUE, plty = 1, lwd = 2)
+}
+par(mfrow = c(1, 1))
+```
+
+
+
+
+### ANOVA
+An univariate test, in LM for testing the individual effect of each feature on the target
+Well suited for continuous variables and requires a binary target
+If feature is numerical and target is numerical OR categorical
+Provides the F-value => measures the signal-to-noise ratio. In your case, it compares the variance between your clusters (the signal) against the variance inside those clusters (the noise)
+Question of the test: Is the mean of this descriptor different across my clusters?
+
+```{r}
+data_s_anova <- data.frame(data_s[-1], cut = factor(data_s_cluster))
+
+# ANOVA test results
+for (i in 1:(ncol(data_s_anova) - 1)) {
+  print(paste("descripteur : ", colnames(data_s_anova)[i], sep = ""))
+  print(summary(aov(data_s_anova[, i] ~ cut, data = data_s_anova)))
+}
+
+# Visualisation
+par(mfrow = c(2, 2))
+for (i in 1:(ncol(data_s_anova) - 1)) {
+  mon_titre <- paste(colnames(data_s_anova)[i])
+  plot(TukeyHSD(aov(data_s_anova[, i] ~ cut, data = data_s_anova)))
+  title(main = mon_titre)
+}
+par(mfrow = c(1, 1))
+```
+
+
+
+# Partie 2. Analyse Non-Supervisée (Visualization)
+Deux méthodes de visualisation etudié:
+
+- MDS
+```{r HCA cluster visualisation}
+#with the nb of classes set in HCA, we visualise the data and color by optimal nb of classes 
+
+dts.cluster <- cutree(data_s_hca, k = 3)
+dts_cmds <- cmdscale(dts.euc)
+plot(dts_cmds, col = dts.cluster)
+abline(h = 0, v = 0, lty = 2)
+text(dts_cmds, labels = rownames(data_s), cex = 0.5, pos = 1, col = dts.cluster)
+```
+
+```{r kclust visualisation}
+#visualise diff nstart values with mds
+# more visual with 4 clusters, but we set 3 clust for this project
+par(mfrow = c(1, 3))
+plot(dts_cmds, col = kclust_instable, main = "nstart = 1")
+abline(h = 0, v = 0, lty = 2)
+text(dts_cmds, labels = rownames(data_s), cex = 0.5, pos = 1, col = kclust_instable)
+plot(dts_cmds, col = kclust_stable_1, main = "nstart = 50")
+abline(h = 0, v = 0, lty = 2)
+text(dts_cmds, labels = rownames(data_s), cex = 0.5, pos = 1, col = kclust_stable_1)
+plot(dts_cmds, col = kclust_stable_2, main = "nstart = 50")
+abline(h = 0, v = 0, lty = 2)
+text(dts_cmds, labels = rownames(data_s), cex = 0.5, pos = 1, col = kclust_stable_2)
+
+```
+
+- PCA
+##Analyse de l'inertie et Cercle des corrélations
+
+```{r}
+res.pca <- PCA(data_s, graph = FALSE)
+fviz_eig(res.pca)
+fviz_pca_var(res.pca, col.var = "contrib", gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"))
+```
+
+
+##Biplot et Habillage par Cluster
+```{r}
+fviz_pca_biplot(res.pca, habillage = data_s_hca, addEllipses = TRUE)
+```
+
+
+# Partie 3. Modélisation Prédictive (Supervisée)
+
+Deux méthodes supervisée etudié:
+
+- Linear regression (LM)
+- CART ()
+
+L’apprentissage supervisé nécessite de diviser les données en un ensemble de trains pour construire le modèle et un ensemble de tests pour évaluer la performance sur des données inconnues.
+
+Les méthodes de régression permettent connaissant des descripteurs (variables indépendantes Xi)
+de prédire une (ou des) variables quantitatives Y. La régression linéaire multiple (LMR)
+est une de ces méthodes. Elle va nous permettre de prédire la variable Y = score, le score de druggabilité.
+
+## 1. Régression Linéaire Multiple (Prédiction du Score)
+
+### a. MLR test (data non nettoyé)
+
+But: faire rapidement un modèle de régression linéaire multiple sur l’ensemble 
+des données, donc sans préparation, nettoyage préalable des données.
+
+```{r raw test}
+#load("data_raw.Rdata")
+#raw <- data_raw[, -1]
+lm_raw <- lm(score ~ ., data = data_clean)
+summary(lm_raw)
+
+plot(score ~., data=data_clean, pch=19, col="darkblue")
+abline(lm_raw, col="red")
+```
+Que se passe t’il ? Que pensez-vous de ce modèle ?
+
+1. Tout d'abord on note l'absence des valeurs pour la variable "positif". 
+La remarque "1 not defined because of singularities" signifie que la variable "positif"
+est parfaitement multicolinéaire avec la variable "négatif".
+2. Les $R^2$  sont presque parfait: 0.9477 (Adjusted R-squared:  0.9392), ce que veut dire
+que le modèle explique parfaitemnt 94% de la variance du score. Real_volume est le descripteur
+le plus significative avec un p-value tres petit, qui explique donc (presque) la totalité de données.
+3. Erreur standard résiduelle est de 39.53. Cela signifie qu'en moyenne, le modèle se trompe de 
++/- 39 unités sur le score de druggabilité, ce que est tres bien, comme prediction, mais en realité
+cela va causer des problemes de over-fitting.
+
+### b. Preparation pour LMR & étude des variables
+```{r variable score}
+
+# Split Train/Test
+sample_idx <- sample(1:nrow(data_clean), size = nrow(data_clean)*0.7)
+train_set <- data_clean[sample_idx, ]
+test_set <- data_clean[-sample_idx, ]
+
+#
+summary(train_set[, "score"])
+par(mfrow = c(1, 2))
+hist(train_set[, "score"], main = "score de druggabilité")
+boxplot(train_set[, "score"], main = "score de druggabilité")
+par(mfrow = c(1, 1))
+```
+
+### c. MLR Calcululation
+Régression linéaire multiple de la forme :
+score=β0+β1X1+⋯+βjXj
+
+1. Sélectionner les descripteurs Xi pertinents par rapport à la variable à prédire;
+    - lm() pour tout les descripteurs;
+    - seulement les descripteurs pour lesquels le modèle a une valeur de p_value 
+    inférieur à un seuil donné sont gardés
+2. établir le modèle;
+3. étudier la qualité du modèle, en étudiant les résidus : ei=yi−y^i
+    a. les résidus sont distribués normalement ei:N(0,σ2)
+        - un histogramme des résidus
+        - un qqplot des résidus
+    b. les résidus sont indépendants
+    c. les résidus sont tous de même variance (homoscédasticité)
+4. calculer les performances du modèle
+    a. R2, R2adj et RMSE, sur les échantillons d’apprentissage et de validation postResample()
+    b. en représentant graphiquement y^i=f(yi)
+
+```{r check the significance of var}
+yx_lm = numeric(length = ncol(train_set) - 1)
+for (i in 1:(ncol(train_set) - 1)) {
+  to_lm <- c(names(train_set)[i], "score")
+  data.lm <- train_set[, to_lm]
+  mod.lm <- lm(score ~ ., data = data.lm)
+  yx_lm[i] <- summary(mod.lm)$coefficients[[2, 4]] 
+}
+yx_lm <- c(yx_lm, 0)
+hist(yx_lm)
+#how many variables to remove and which ones
+sum(yx_lm < 0.5)
+names(train_set)[yx_lm < 0.5]
+```
+```{r update train and test set}
+new_train_set <- train_set
+new_test_set <- test_set
+vars_keep <- c(names(train_set)[yx_lm < 0.5])
+train_set <- train_set[, vars_keep]
+test_set <- test_set[, vars_keep]
+```
+
+```{r LMR}
+# Modèle complet et sélection par Stepwise
+mlr1 <- lm(score ~ ., data = train_set)
+print(mlr1)
+summary(mlr1)
+AIC(mlr1)#the smaller the AIC, the better the fit. 
+          #Formula : AIC = 2k-2ln(L), where k is number of parameters 
+          # L is joint likelihood
+```
+Meme apres le nettoyage, la seule variable hautement significative (p<2*10−16) est Real_volume.
+La variable Mean_alpha.sphere_radius est "presque" significative; cela suggère que
+la forme de la cavité joue un rôle secondaire.
+
+L'equation du modele est ainsi: Score=−119.53−58.16*(negatifs)+26.02*(petits)+
+0.02*(C_ATOM)+0.64*(C_RESIDUES)+0.18*(Real_volume)+59.01*(Radius)+
+9.60*(Prop_apolar)−49.08*(B.factor)−213.26*(SA)
+
+R2 est 0.9576, donc 95,7% de la variation du score est expliquée par ces variables
+R2_adj (penalise les variables redondantes) est aussi élevé (0.9519).
+
+Le modele est tres precis, mais trop complexe. Il faut reduire le niveau des 
+descripteurs pour avouir un modele vraiment robutste, sinon on risque de sur-apprentissage.
+
+```{r graphic representation}
+par(mfrow = c(1, 2))
+hist(mlr1$residuals, main = "SANS sélection de descripteurs")
+qqnorm(mlr1$residuals, main = "SANS sélection de descripteurs")
+qqline(mlr1$residuals, main = "")
+par(mfrow = c(1, 1))
+```
+Commentez vos résultats.
+
+```{r scatter plot MLR}
+plot(mlr1$fitted.values, mlr1$residuals, main = "SANS sélection de descripteurs")
+abline(h = 0)
+par(mfrow = c(1, 1))
+```
+Commentez vos résultats. Les résidus ont-ils des propriétés acceptables ?
+
+### d. Analyse des individus influents
+
+```{r}
+par(mfrow = c(1, 2))
+plot(mlr1, which = 5) #outputs Std residuals 
+plot(mlr1, which = 4) #outputs cook's distance
+par(mfrow = c(1, 1))
+```
+1. Residuals vs Leverage: permet de voir s'il y a une erreur de prediction (axe vertical) 
+et characteristiques d'une poche (leverage). Les points extremes sur 
+ses axes (fort levier + fort résidu) cause un disbalance pour lm et 
+penche la droite vers lui. On peut donc enlever temporairement ses point et
+re-verifier la robustesse du modele.
+*Leverage refers to the extent to which the coefficients in the 
+regression model would change if a particular observation was removed from the dataset
+
+Ici, on n'observe pas des points exterement influents, qui depassesnt les bords de distance de Cook
+
+2. La Distance de Cook: 
+Un individu est jugé influent si sa distance de Cook est supérieure à 1. Si le seuile est de 1,
+on n'impose pas des point influents. 
+Si plus stricte: seuil = 4/n (où n est le nombre d'observations), soit ici 4/109 = 0.037. 
+On observe ici au moins trois tels individus:2GYI, 1WVC, 1JAK, qui sont les plus élevés.
+
+### e. Performance du modele
+
+On calcule le valeurs pour decrire le performance de notre modele:
+ - calcul des valeurs prédites y^i sur les données des échantillons d’apprentissage 
+ et de validation: predict(). 
+ - calcul des performances en terme de R2, RMSE: postResample(caret)
+ - représentant graphiquement y^i=f(yi)
+
+```{r MLR train}
+#plot
+mlr1_pred_train <- mlr1$fitted.values
+plot(train_set[, "score"], mlr1_pred_train,
+     xlab = 'yobs', ylab = 'ypred', main = "on train set")
+#performance terms:
+r2adj <- function(r2, n, p) {
+  result <- 1 - ( (1 - r2) * (n - 1) / (n - p - 1) )
+  return(result)
+}
+perf_complet_train <- postResample(pred = mlr1_pred_train, obs = train_set[, "score"])[1:2]
+r2adj_complet_train <- r2adj(perf_complet_train[2], nrow(train_set), ncol(train_set) - 1)
+perf_complet_train <- c(perf_complet_train, r2adj_complet_train)
+names(perf_complet_train)[3] <- "adj r2"
+print(perf_complet_train)
+```
+
+```{r MLR test}
+
+mlr1_pred_test <- predict(mlr1, newdata = test_set)
+plot(test_set[, "score"], mlr1_pred_test,
+     xlab = 'yobs', ylab = 'ypred', main = "on test set")
+
+perf_complet_test <- postResample(pred = mlr1_pred_test, obs = test_set[, "score"])[1:2]
+r2adj_complet_test <- r2adj(perf_complet_test[2], nrow(test_set), ncol(test_set)-1)
+perf_complet_test <- c(perf_complet_test, r2adj_complet_test)
+names(perf_complet_test)[3] <- "adj r2"
+print(perf_complet_test)
+
+```
+
+```{r}
+par(mfrow = c(1, 2))
+plot(train_set[, "score"], mlr1_pred_train,
+     xlab = 'yobs', ylab = 'ypred', main = "on train set")
+plot(test_set[, "score"], mlr1_pred_test,
+     xlab = 'yobs', ylab = 'ypred', main = "on test set")
+par(mfrow = c(1, 1))
+```
+
+
+En analysant toutes ces informations, que pensez-vous des performances de votre modèle ? En apprentissage ? En validation ?
+
+### f. Le modèle avec sélection de variables
+
+Si on garde seulement Real_volume pour construire MLR?
+
+```{r}
+mlr2 <- step(mlr1, method = "backward")
+summary(mlr2)
+```
+
+```{r update train and test set 2}
+train_set_sel <- train_set["Real_volume"]
+test_set_sel <- test_set["Real_volume"]
+```
+
+Cette fonction est très “verbeuse”. Comprenez-vous tous les affichages qu’elle propose ? Au final, quel est le modèle sélectionné?
+
+Backward Elimination () permet de comparer les scores AIC,
+qui mesure l'équilibre entre la précision du modèle et sa complexité,
+et definir les variables inutiles (AIC augmente).
+On a appliqué une procédure de sélection descendante (Stepwise Backward) basée sur le critère d'Akaike (AIC).
+Le modèle initial (AIC=555.75) comprenait 9 descripteurs. La procédure a éliminé successivement
+les variables redondantes ou non informatives (C_ATOM, Proportion_apolar, C_RESIDUES, etc.).
+Le modèle final (AIC=547.15) ne conserve que le Real_volume. Cela démontre que
+la taille de la poche est le descripteur prédominant pour expliquer le score de druggabilité
+dans ce jeu de données, et que les autres variables n'apportaient pas de gain d'information statistiquement significatif.
+
+```{r graphical representaion for mlr2}
+par(mfrow = c(2, 2))
+plot(mlr2)
+par(mfrow = c(1, 1))
+```
+
+```{r}
+# --- Calcul des performances pour MLR2 (Sélectionné) ---
+
+# Train
+mlr2_pred_train <- mlr2$fitted.values
+perf_sel_train <- postResample(pred = mlr2_pred_train, obs = train_set[, "score"])
+# On récupère le R2 adj directement du modèle
+r2_adj_train_val <- summary(mlr2)$adj.r.squared 
+perf_sel_train <- c(perf_sel_train[1:2], "adj r2" = r2_adj_train_val)
+
+# Test
+mlr2_pred_test <- predict(mlr2, newdata = test_set)
+perf_sel_test <- postResample(pred = mlr2_pred_test, obs = test_set[, "score"])
+# Attention : summary(mlr2)$adj.r.squared donne le R2adj du TRAIN. 
+# Pour le TEST, on utilise ta fonction r2adj avec p = 1
+r2_adj_test_val <- r2adj(perf_sel_test[2], n = nrow(test_set), p = 1)
+perf_sel_test <- c(perf_sel_test[1:2], "adj r2" = r2_adj_test_val)
+```
+
+
+
+```{r MLR2 prediction}
+
+#train
+mlr2_pred_train <- mlr2$fitted.values
+
+perf_sel_train <- postResample(pred = mlr2_pred_train, obs = train_set[, "score"])[1:2]
+r2adj_sel_train <- r2adj(perf_sel_train[2], nrow(train_set), ncol(train_set) - 1)
+perf_sel_train <- c(perf_sel_train, r2adj_sel_train)
+names(perf_sel_train)[3] <- "adj r2"
+print(perf_sel_train)
+
+#test
+mlr2_pred_test <- predict(mlr2, newdata = test_set)
+
+perf_sel_test <- postResample(pred = mlr2_pred_test, obs = test_set[, "score"])[1:2]
+r2adj_sel_test <- r2adj(perf_sel_test[2], nrow(test_set),p = 1)
+perf_sel_test <- c(perf_sel_test, r2adj_complet_test)
+names(perf_sel_test)[3] <- "adj r2"
+print(perf_sel_test)
+```
+
+```{r}
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1)) # 2x2 avec marges ajustées
+
+# Modèle complet (Ligne 1)
+lims <- c(0, 750)
+
+plot(train_set$score, mlr1_pred_train, xlim = lims, ylim = lims, 
+     main = "Descripteurs réduit - Train", xlab = "Observé", ylab = "Prédit",pch = 20, col = rgb(0.2,0.4,0.6,0.5))
+abline(0, 1, lty = 2, col = "red")
+text(50, 650, labels = sprintf("R²adj: %.3f", perf_complet_train[3]), pos = 4, col = "blue")
+
+plot(test_set$score, mlr1_pred_test, xlim = lims, ylim = lims, 
+     main = "Descripteurs réduit - Test", xlab = "Observé", ylab = "Prédit",pch = 20, col = rgb(0.2,0.4,0.6,0.5))
+abline(0, 1, lty = 2, col = "red")
+text(50, 650, labels = sprintf("R²adj: %.3f", perf_complet_test[3]), pos = 4, col = "darkgreen")
+
+# Modèle sélectionné (Ligne 2)
+plot(train_set$score, mlr2_pred_train, xlim = lims, ylim = lims, 
+     main = "Sélectionné par stepwise\n (Real_Volume) - Train", xlab = "Observé", ylab = "Prédit",pch = 20, col = "grey40")
+abline(0, 1, lty = 2, col = "red")
+text(50, 650, labels = sprintf("R²adj: %.3f", perf_sel_train[3]), pos = 4, col = "blue")
+
+plot(test_set$score, mlr2_pred_test, xlim = lims, ylim = lims, 
+     main = "Sélectionné par stepwise\n (Real_Volume) - Test", xlab = "Observé", ylab = "Prédit",pch = 20, col = "grey40")
+abline(0, 1, lty = 2, col = "red")
+text(50, 650, labels = sprintf("R²adj: %.3f", perf_sel_test[3]), pos = 4, col = "darkgreen")
+
+par(mfrow = c(1, 1))
+```
+
+
+### MLR Resumé
+```{r MLR resume}
+#model wo selection
+
+par(mfrow = c(2, 2))
+plot(train_set[, "score"], mlr1_pred_train, xlim = c(0, 700), ylim = c(0, 700),
+     xlab = 'yobs', ylab = 'ypred', main = "on train set")
+text(x = 100, y = 600, labels = sprintf("R2_adj = %3.3f", perf_complet_train[3]), col = "red")
+plot(test_set[, "score"], mlr1_pred_test, xlim = c(0, 700), ylim = c(0, 700),
+     xlab = 'yobs', ylab = 'ypred', main = "on test set")
+text(x = 100, y = 600, labels = sprintf("R2_adj = %3.3f", perf_complet_test[3]), col = "green")
+
+#selected descriptor(Real_Volume)
+plot(train_set[, "score"], mlr2_pred_train,
+     xlab = 'yobs', ylab = 'ypred', main = "on train set")
+text(x = 100, y = 700, labels = sprintf("R2_adj = %3.3f", perf_sel_train[3]), col = "red")
+plot(test_set[, "score"], mlr2_pred_test,
+     xlab = 'yobs', ylab = 'ypred', main = "on test set")
+text(x = 100, y = 700, labels = sprintf("R2_adj = %3.3f", perf_sel_test[3]), col = "green")
+par(mfrow = c(1, 1))
+```
+
+
+
+## 2. Arbres de Décision (CART)
+
+- **Arbres de décision (CART):** Segmente les données en posant des questions logiques "si-alors" basées sur des descripteurs. En R : `rpart()` pour construire l’arbre et `prp() pour le visualiser.
+
+### a. Lecture des donnees
+1. Pour predire druggabilite avec CART dans df on doit avoir le score (score reel dans train et predit dans test)
+
+```{r train&test set (same as before)}
+sample <- sample(1:nrow(data_clean), size = nrow(data_clean)*0.7, replace = FALSE)
+Y <- data$drugg
+train_set_cart <- train_set[,-1]
+test_set_cart <- test_set[,-1]
+train_set_cart$drugg <- Y[sample]
+test_set_cart$drugg <- Y[-sample]
+```
+
+```{r view datasets & chemical space}
+PCA(rbind(train_set_cart[, -10], test_set_cart[, -10]), ind.sup = 88:109)
+```
+
+2. étudier autocorrélation
+
+```{r autocorrelation check}
+corr_matrix <- cor(train_set)
+redundant_variables <- findCorrelation(corr_matrix, cutoff = 0.95)
+train_clean <- variables[, -redundant_variables]
+dim(train_clean)
+```
+
+### b. Construction CART
+
+établir le modèle de classification (prediction de druggabilite; df sans score!)
+
+```{r CART}
+fit <- rpart(drugg ~ ., control = rpart.control(minsplit = 5), data = train_set_cart)
+prp(fit, type = 2, extra = 2, main = "Arbre de décision pour la Druggabilité")
+printcp(fit)
+plotcp(fit)
+#know how to explain this
+```
+L’argument extra=2 : permet de préciser pour chaque noeud/feuille le taux de classification en donnant :
+
+    le nombre de classifications correctes (valeur à gauche du “/”)
+    le nombre d’observations dans le noeud (valeur à droite du “/”).
+
+Analysez ce modèle ? Quels sont les descripteurs qui sont impliqués dans le modèle
+
+### c. Performance de l’arbre complet
+
+```{r train prediction}
+#on train 
+train_cart_pred <- predict(fit, newdata = train_set_cart, type = "class")
+table(train_cart_pred)
+#Returns predicted class labels (for classification models)
+
+fitCart.train.prob <- predict(fit, newdata = train_set_cart, type = "prob")[,"1"]
+
+# Calcul de la courbe ROC
+fitCart.train.roc <- roc(train_set_cart[,"drugg"] == 1, fitCart.train.prob)
+
+#confusion matix
+(conf.fitCart.train <- confusionMatrix(data = train_cart_pred, 
+                                   reference = train_set_cart[, "drugg"],
+                                   positive = "1"))
+
+#purposefully bad prediction
+badPredict <- which((as.numeric(train_cart_pred)- as.numeric(train_set_cart[, "drugg"]))!=0)
+
+#ROC curve
+
+plot(1 - fitCart.train.roc$falsepos, 
+     fitCart.train.roc$sens,
+     type = "l", xlab = "1 - Sp", ylab = "Se",
+     xlim = c(1,0), ylim =c(0,1),
+     main = "ROC curve on train set")
+abline(a = 1, b = -1, lty = 2)
+
+```
+
+
+
+```{r test prediction}
+#sur test
+fitCart.test.pred <- predict(fit, newdata = test_set_cart, type = "class")
+table(fitCart.test.pred)
+
+#confusion matrix
+(conf.fitCart.test <- confusionMatrix(data = fitCart.test.pred, 
+                                   reference = test_set_cart[, "drugg"],
+                                   positive = "1"))
+
+#ROC curve
+fitCart.test.prob <- predict(fit, newdata = test_set_cart, type = "prob")[,"1"]
+fitCart.test.roc <- roc(test_set_cart[, "drugg"] == "1", fitCart.test.prob)
+
+plot(1 - fitCart.test.roc$falsepos, 
+     fitCart.test.roc$sens,
+     type = "l", xlab = "1 - Sp", ylab = "Se",
+     xlim = c(1,0), ylim =c(0, 1),
+     main = "ROC curve on test set")
+abline(a = 1, b = -1, lty = 2)
+
+```
+### d. Comparaison test&train
+
+```{r}
+plot(1 - fitCart.train.roc$falsepos, 
+     fitCart.train.roc$sens,
+     type = "l", xlab = "1 - Sp", ylab = "Se",
+     main = "ROC curve", col = "red",
+     xlim = c(1,0), ylim =c(0, 1),)
+abline(a = 1, b = -1, lty = 2)
+lines(1 - fitCart.test.roc$falsepos, 
+     fitCart.test.roc$sens,
+     col = "green",xlim = c(1,0), ylim =c(0, 1),)
+legend("bottomright", legend = c("train", "test"),
+       col = c("red", "green"), bty = "n", lty=1)
+```
+### e.
+
+```{r performance evaluation}
+
+
+```
+
+##3. Régression logistique multiple
+
+```{r}
+summary(glm(drugg ~ ., data = data_wo_score,
+            family = "binomial"))
+```
+
+Que se passe t'il ? Commentez le résultat.
+
+# Régression logistique sur les données nettoyées
+
+```{r echo = FALSE, include = FALSE}
+summary(train_set[, "score"])
+barplot(table(train_set[, "score"]), main = "druggabilité")
+```
+
+## le modèle
+
+### préselection des descripteurs d'intéret pour la variable `drugg`
+
+#### régression logistique par descripteur
+
+Afin de sélectionner des descripteurs qui ont du sens par rapport à la variable à prédire, c'est dire qui ont un lien avec la druggabilité, nous allons établir des modèles de régression linéaire simple.Ici, vous devez établir des modèles de régression logistique simple pour chaque descripteur et récupérer la pvalue associée. Pour récupérer ces pvalues l'une des solutions est de regarder les coefficients associés au résumé du modèle, de récupérer la pvalue, et de stocker ces pvalues dans un vecteur. 
+
+- `resume <- summary(modele)$coefficients`
+- `v_pvalue <- c(v_pvalue, resume[2, 4])`
+
+```{r}
+new_train_set <- data_clean[sample_idx, ]
+new_test_set <- data_clean[-sample_idx, ]
+new_train_set <- new_train_set[-1]
+new_test_set <- new_test_set[-1]
+new_train_set$drugg <- Y[sample_idx]
+new_test_set$drugg <- Y[-sample_idx]
+
+
+yx_glm = numeric(length = ncol(new_train_set)-1)
+for (i in 1:(ncol(new_train_set)-1)) {
+  to_glm <- c(names(new_train_set)[i], "drugg")
+  data.glm <- new_train_set[, to_glm]
+  mod.glm <- glm(drugg ~ ., data = data.glm, family = "binomial")
+  yx_glm[i] <- summary(mod.glm)$coefficients[[2, 4]]
+  names(yx_glm)[i] <- colnames(new_train_set)[i]
+}
+yx_glm <- c(yx_glm, 0)
+```
+
+#### distribution des `p.value`
+
+Vous pouvez visualiser l'histogramme des pvalues
+
+```{r}
+hist(yx_glm)
+sum(yx_glm < 0.5)
+names(new_train_set)[yx_glm < 0.5]
+```
+
+ou mieux, représenter les pvalues de chaque descripteur en ordre décroissant à l'aide de la fonction `order()`.
+
+```{r}
+(pv_order <- order(yx_glm, decreasing = TRUE))
+barplot(yx_glm[pv_order], las = 2)
+```
+
+#### sauvegarde des descripteurs d'interet
+
+Et sélectionner les variables pour lesquelles la pvalue est inférieur à une valeur seuil. Comment allez-vous fixer la valeur seuil ? Essayer des valeurs seuils de 0.5, 0.3 et 0.05 par exemple.
+
+```{r}
+train_set_be4select <- new_train_set
+test_set_be4select <- new_test_set
+to_keep <- c(names(new_train_set)[yx_glm < 0.5])
+new_train_set <- new_train_set[, to_keep]
+new_test_set <- new_test_set[, to_keep]
+```
+
+
+### le modèle :
+
+Calculer le modèle et faites un résumé du modèle pour visualiser les coefficients et les pvalues affectés à chaque descripteur.
+
+```{r}
+mreglog <- glm(drugg ~ ., data = new_train_set, family = "binomial")
+summary(mreglog)
+```
+
+Que pensez-vous de ce modèle ? Que représente les deux déviances ? Que représente l'AIC ?
+
+### les performances du modèle
+
+Pour finir, nous établissons les performance du modèles. Prenez le temps de regarder les aides des fonctions `confusionMatrix(caret)` et `roc(pROC)`, afin de vérifier le type des paramètres d'entrée, vecteur de probabilité ou vecteur de classe.
+
++ calcul des valeurs prédites par le modèle sur les données d'apprentissage et de validation à l'aide de la fonction `predict()`.
++ en terme de table de confusion, de taux de bien prédit (accuracy), sensibilité et spécificité, à l'aide de la fonction `confusionMatrix(caret)`
++ en représentant graphiquement la courbe ROC, $Sens = f(1 - Spe)$, à l'aide de la fonction `roc(pROC)`
+
+pour les échantillons d'apprentissage et les échantillons de validation.
+
+Appliquons tout cela à nos données.
+
+### sur l'échantillon train
+
+#### les prédictions
+
+```{r model.lmr.pred.train}
+mlog_train_pred <- predict(mreglog, newdata = new_train_set, 
+                           type = "response")
+```
+
+Que renvoie la fonction `predict()` ici ? Comment savoir si cela veut dire que la poche est *druggable* ou *moins druggable* ?
+
+Pour vous aider, vous pouvez afficher un histogramme des valeurs prédites.
+
+```{r}
+hist(mlog_train_pred)
+```
+
+Intuitivement, et par défaut, on choisit un seuil de 0.5 pour décider si une poche est prédite druggable ou non. Mais cette valeur de seuil peut être optimiser, surtout si nos données sont déséquilibrées.
+
+#### la matrice de confusion
+
+Nous calculons la matrice de confusion à l'aide de la fonction `confusionMatrix()`, après avoir transformé les probabilités prédites par le modèle grâce à la fonction `predict()` en classe, "druggable" ou "moins druggable". Vous utiliserez la règle suivante :
+
+- si la probabilité < 0.5, la poche est "moins druggable"
+- si la probabilité > 0.5, la poche est "druggable"
+
+```{r}
+seuil = 0.5
+mlog_train_pred_class <- as.factor(ifelse(mlog_train_pred < seuil, 0, 1))
+```
+
+Pourquoi avoir choisi le seuil de 0.5 ? Que se passe t'il si vous faites varier ce seuil ? Quelles sont les valeurs limites du seuil ?
+
+```{r}
+(conf_mlog_train <- confusionMatrix(data = mlog_train_pred_class, 
+                                   reference = new_train_set[, "drugg"],
+                                   positive = "1"))
+```
+
+#### la courbe ROC
+
+Pourquoi faut-il donner en entrée pour le calcul de la courbe ROC, les valeurs observées de druggabilité ("drugg") et les probabilités prédites par le modèle ?
+
+```{r}
+mlog_train_roc <- roc(new_train_set[, "drugg"] == "1",
+                      mlog_train_pred) 
+plot(1 - mlog_train_roc$specificities, 
+     mlog_train_roc$sensitivities,
+     type = "l", xlab = "1 - Sp", ylab = "Se",
+     main = "ROC curve on train set")
+abline(a = 1, b = -1, lty = 2)
+```
+
+Que pensez-vous du résultat ?
+
+### sur l'échantillon test
+
+Calculez la matrice de confusion et la courbe ROC sur l'échantillon `test` de la même manière.
+
+#### les prédictions
+
+```{r model.lmr.pred.test}
+mlog_test_pred <- predict(mreglog, newdata = test_set, type = "response")
+hist(mlog_test_pred)
+```
+
+#### la matrice de confusion
+
+```{r}
+seuil = 0.5
+mlog_test_pred_class <- as.factor(ifelse(mlog_test_pred < seuil, 0, 1))
+(conf_mlog_test <- confusionMatrix(data = mlog_test_pred_class, 
+                                   reference = new_test_set[, "drugg"],
+                                   positive = "1"))
+```
+
+#### la courbe ROC
+
+```{r}
+mlog_test_roc <- roc(test_set[, "score"] == "1",
+                      mlog_test_pred) 
+plot(1 - mlog_test_roc$specificities, 
+     mlog_test_roc$sensitivities,
+     type = "l", xlab = "1 - Sp", ylab = "Se",
+     main = "ROC curve on test set")
+abline(a = 0, b = 1, lty = 2)
+```
+
+### Comparaison
+
+1. afin de comparer les résultats sur les échantillons d'apprentissage et de test, nous pouvons afficher les deux courbes ROC sur le même graphique
+
+```{r}
+plot(1 - mlog_train_roc$specificities, 
+     mlog_train_roc$sensitivities,
+     type = "l", xlab = "1 - Sp", ylab = "Se",
+     main = "ROC curve", col = "red")
+abline(a = 0, b = 1, lty = 2)
+lines(1 - mlog_test_roc$specificities, 
+     mlog_test_roc$sensitivities,
+     col = "green")
+legend(x = 0.9, y = 0.4, legend = c("train", "test"),
+       text.col = c("red", "green"), bty = "n")
+```
+
+2. et faire un tableau compilant les taux de bien prédit, la sensibilité et la spécificité du modèle pour les échantillons `train` et `test`.
+
+```{r echo = TRUE, eval = TRUE}
+perf <- matrix(NA, nrow = 2, ncol = 3)
+rownames(perf) <- c("train", "test")
+colnames(perf) <- c("taux de bien prédit", "sensibilité", "spécificité")
+knitr::kable(perf)
+```
+
+
+```{r}
+perf_train <- c(conf_mlog_train$overall[c("Accuracy")],
+                conf_mlog_train$byClass[c("Sensitivity", "Specificity")])
+perf_test <- c(conf_mlog_test$overall[c("Accuracy")],
+                conf_mlog_test$byClass[c("Sensitivity", "Specificity")])
+perf <- rbind(train = perf_train, test = perf_test)
+colnames(perf) <- c("taux de bien prédit", "sensibilité", "spécificité")
+kable(perf, align = "c")
+```
+
+En analysant toutes ces informations, que pensez-vous des performances de votre modèle ? En apprentissage ? En validation ?
+
+Y a t'il une perte de performance entre les deux échantillons `train` et `test`? Y a t'il surajustement ?
+
+# Régression logistique : le modèle avec sélection de variables
+
+En vous **inspirant** du "TP 3 : régression linéaire mutliple" et de ce qui a été fait précédemment,
+
+- établissez le modèle de régression logistique avec sélection des variables (fonction `step()`),
+- calculez les performances du modèle sur les échantillons `train` et `test`
+- commentez vos résultats
+
+```{r, echo = FALSE}
+mreglog_sel <- step(mreglog)
+summary(mreglog_sel)
+mlog_sel_train_pred <- predict(mreglog_sel, newdata = train_set, type = "response")
+seuil = 0.5
+mlog_sel_train_pred_class <- as.factor(ifelse(mlog_sel_train_pred < seuil, 0, 1))
+(conf_mlog_sel_train <- confusionMatrix(data = mlog_sel_train_pred_class, 
+                                   reference = train_set[, "score"],
+                                   positive = "1"))
+mlog_sel_test_pred <- predict(mreglog_sel, newdata = test_set, type = "response")
+seuil = 0.5
+mlog_sel_test_pred_class <- as.factor(ifelse(mlog_sel_test_pred < seuil, 0, 1))
+(conf_mlog_sel_test <- confusionMatrix(data = mlog_sel_test_pred_class, 
+                                   reference = test_set[, "score"],
+                                   positive = "1"))
+descr_sel <- names(mreglog_sel$coefficients)[-1]
+```
+
+# Conclusion
+
+## Quel est le meilleur modèle selon vous ? Pourquoi ?
+
+**attention : ** les exemples sont pris sur le modèle complet, vous devez le faire sur le modèle avec sélection des variables.
+
+## Valeur optimale du seuil
+
+En particulier, on peut se poser la question du meilleur seuil lors du calcul de la matrice de confusion. La librairie `pROC` fournit une solution pour calculer ce meilleur seuil, à l'aide de la fonction `coords(pROC)`.
+
+### calcul
+
+```{r}
+best_seuil_roc_train <- coords(mlog_train_roc, "best", "threshold")
+```
+
+### visualisation
+
+On peut le visualiser sur les courbes ROC.
+
+```{r}
+plot(1 - mlog_train_roc$specificities, 
+     mlog_train_roc$sensitivities,
+     type = "l", xlab = "1 - Sp", ylab = "Se",
+     main = "ROC curve", col = "red")
+abline(a = 0, b = 1, lty = 2)
+points(x = 1 -  best_seuil_roc_train$specificity, 
+       y = best_seuil_roc_train$sensitivity, pch = 11, col = "blue")
+lines(1 - mlog_test_roc$specificities, 
+     mlog_test_roc$sensitivities,
+     col = "green")
+legend(x = 0.9, y = 0.4, legend = c("train", "test"),
+       text.col = c("red", "green"), bty = "n")
+```
+
+### matrice de confusion
+
+Qu'est-ce que cela implique sur la matrice de confusion ?
+
+```{r}
+seuil = best_seuil_roc_train$threshold
+mlog_train_pred_class <- as.factor(ifelse(mlog_train_pred < seuil, 0, 1))
+(conf_mlog_train <- confusionMatrix(data = mlog_train_pred_class, 
+                                   reference = train_set[, "score"],
+                                   positive = "1"))
+mlog_test_pred_class <- as.factor(ifelse(mlog_test_pred < seuil, 0, 1))
+(conf_mlog_test <- confusionMatrix(data = mlog_test_pred_class, 
+                                   reference = test_set[, "score"],
+                                   positive = "1"))
+```
+
+Est-ce le meilleur modèle ? Pourquoi ?
+
+
+#CONCLUSION
+
+```{r}
+
+```
+
+Etablir un modèle en classification / discrimination de la variable drugg
+2. Etablir un modèle en régression de la variable score
+comparer vos résultats avec les modèles de régression linéaire ou logistique réalisés précédemment

@@ -1,0 +1,1008 @@
+---
+title: "Prédiction de la druggabilité de poches protéiques"
+#subtitle: "UE: Intelligence artificielle avancée pour le Drug Design"
+categories: [Analyse des donées massives, IA, R]
+format: 
+  pdf:
+    geometry:
+      - margin=1in
+    keep-tex: true
+    template-partials: 
+      - title.tex
+    include-in-header:
+      text: |
+        \usepackage[noblocks]{authblk}
+        \renewcommand*{\Authsep}{, }
+        \renewcommand*{\Authand}{, }
+        \renewcommand*{\Authands}{, }
+        \renewcommand\Affilfont{\small}
+    toc: true
+    number-sections: true
+    colorlinks: true
+author:
+    - name: Laurédane Coustillas
+      affil-id : 1
+      ref: 1
+    - name: Farah-Luna Gonzalez
+      affil-id : 1
+      ref: 1
+    - name: Anna Perova
+      affil-id : 1
+      ref: 1
+affiliations:
+    - id : 1
+      name: "Université Paris Cité - BI-ISDD - Modélisation des macromolécules"
+execute:
+  echo: false
+  warning: false
+  message: false
+abstract:
+    "Les poches protéiques constituent les régions structurales susceptibles d'accueillir des ligands. Leur composition physicochimique, leur taille et leur géométrie peuvent être liées à leur capacité à fixer un candidat médicament, c'est-à-dire à leur druggabilité."
+date: today
+---
+# Introduction
+
+Dans ce projet on cherche à déterminer **si les descripteurs d'une poche ligand-based permettent de prédire sa druggabilité**.
+
+Conformément aux consignes du poly, le projet est organisé autour des six étapes suivantes :
+
+- Étapes:
+    a. Constitution des jeux train/test et intégration de la validation croisée (CV)
+    b. Clustering sur le train
+    c. ACP (linéaire puis non linéaire) sur le train
+    d. Régression linéaire multiple (MLR) avec CV pour prédire `Score_Drugg`
+    e. CART en régression (`Score_Drugg`) et CART en classification (`druggable`), avec CV
+    f. Évaluation sur le jeu test et comparaison des résultats
+
+*Remarque : la régression logistique n'étant pas obligatoire cette année (cf. consignes transmises), elle n'est pas traitée dans ce document. Les analyses RF/Gradient Boosting et PLS/PLS-DA mentionnées comme pistes d'extension possibles ne sont pas non plus incluses ici — elles peuvent être ajoutées en complément si le temps le permet.*
+
+- Info sur dataset:
+    - L'ensemble de données a été extrait du jeu de données de Krasowski et contient 400 poches :
+        - 316 poches druggables,
+        - 84 poches moins druggables.
+
+Décrit selon 19 variables:
+-   descripteurs quantitatifs de la géométrie de la poche: `hydrophobic_kyte`, `p_hydrophobic_residues`, `p_polar_residues`, `p_aromatic_residues`, `p_aliphatic_residues`, `p_Otyr_atom`,  `p_NE2_atom`, `p_Nlys_atom`, `p_Ntrp_atom`, `p_Ooh_atom`, `p_ND1_atom`,  `SURFACE_HULL`, `DIAMETER_HULL`, `VOLUME_HULL`, `SMALLEST_SIZE`,  `RADIUS_CYLINDER`, `C_RESIDUES`, `NumAtoms_atm`, `Radius_of_gyration_atm`;
+-   descripteur qualitatif: `Shape` (4 types/facteurs: Sphere, Disk, Strongly anisotropic, Rod) d'après *Ziani et al., 2026*;
+
+Variables à prédire: 
+-   Druggabilité (qualitative) = le type de druggabilité de chaque poche : 1 = druggable, 0 = moins druggable (Col 24);
+-   Score_Drugg (quantitative) = score de druggabilité (Col 3).
+
+
+- Packages utilisés:
+`FactoMineR`, `factoextra`, `corrplot`, `gplots`, `pheatmap`, `caret`, `pROC`, `fmsb`, `rpart`, `MASS`, `rpart.plot`, `randomForest`, `dplyr`, `kernlab`, `fpc`, `Hmisc`, `ggplot2`, `tidyr`
+
+# Partie 0. Préparation
+
+## Installation des packages et chargement du dataset
+
+```{r}
+required_packages <- c("FactoMineR", "factoextra", "corrplot", "gplots",
+"pheatmap", "caret", "pROC", "fmsb", "rpart", "MASS", "rpart.plot",
+"randomForest", "dplyr", "kernlab", "fpc", "Hmisc", "ggplot2", "tidyr")
+invisible(lapply(required_packages, require, character.only = TRUE))
+```
+
+1. Lire le fichier 
+```{r}
+file <- read.csv("data.csv")
+# Transformer la variable `Shape` en factor
+file$Shape <- as.factor(file$Shape)
+glimpse(file)
+```
+
+2. Vérifier si les NA sont présents
+```{r}
+file_na <- na.omit(file)
+cat("Dimensions du document d'origine:", dim(file),
+"\nDimensions du document sans NA:", dim(file_na))
+```
+
+## Ajouter la variable à prédire : Druggabilité 
+- Si `Score_Drugg` > 0.5 -> "Druggable"
+- Sinon: "NonDruggable"
+
+```{r}
+# NB : on force un ordre de niveaux explicite (référence = "Non-Druggable")
+# pour que `positive = "Druggable"` soit sans ambiguïté partout dans le reste
+# du document (confusionMatrix, roc, etc.)
+file_na$druggable <- factor(
+  ifelse(file_na$Score_Drugg > 0.5, "Druggable", "NonDruggable"),
+  levels = c("NonDruggable", "Druggable")
+)
+table(file_na$druggable)
+```
+
+## Mise à l'échelle
+- Enlever la variable `Score_Drugg` et les autres variables non-numériques pour mettre les numériques à l'échelle
+- Faire un plot avant/après pour comparer
+
+*Observations: `SURFACE_HULL` et `VOLUME_HULL` sont les plus importants dû à la différence des unités avec le reste des variables ; `scale()` permet de tout normaliser. On note un outlier pour `p_Nlys_atom`, il est possible qu'il faille l'enlever.*
+
+3. Vérifier la normalité 
+
+## Shapiro-Wilk normality test pour toutes les variables
+```{r}
+# Colonnes 4:22 = les 19 descripteurs numériques (hydrophobic_kyte ... Radius_of_gyration_atm)
+p_values <- sapply(file_na[4:22], function(x) shapiro.test(x)$p.value)
+norm_table <- data.frame(
+  Variable = names(file_na[4:22]),
+  p_value = round(p_values, 4),
+  Normal = ifelse(p_values > 0.05, "Yes", "No")
+)
+print(norm_table)
+```
+
+La plupart des descripteurs ont p < 0.05 (non-normaux). La méthode de Spearman est donc plus appropriée pour l'analyse de corrélation.
+
+```{r}
+res <- rcorr(as.matrix(file_na[4:22]), type = "spearman")
+
+p_mat <- res$P
+diag(p_mat) <- 1
+order_aoe <- corrMatOrder(res$r, order = "AOE")
+
+corrplot(res$r[order_aoe, order_aoe], type = "lower", tl.pos = "ld", tl.srt = 45,
+         tl.col = "black", tl.cex = 0.8,
+         col = colorRampPalette(c("#0072B5", "white", "#BC3C29"))(200))
+```
+
+## Vérification des corrélations entre les variables & Plot de la matrice de corrélations
+
+```{r}
+corr_matrix <- cor(file_na[4:22])
+corrplot(corr_matrix, 
+         method = "circle",     
+         type = "lower",        
+         order = "hclust",      
+         tl.col = "black",      
+         tl.srt = 45,           
+         tl.cex = 0.8,          
+         diag = FALSE)
+```
+
+*Observations : les descripteurs de taille/géométrie de la poche (`SURFACE_HULL`, `VOLUME_HULL`, `DIAMETER_HULL`, `RADIUS_CYLINDER`, `NumAtoms_atm`, `C_RESIDUES`, `Radius_of_gyration_atm`) sont fortement corrélés entre eux (redondance géométrique), tandis que les descripteurs de composition chimique (`hydrophobic_kyte`, `p_polar_residues`, `p_aliphatic_residues`...) forment un second bloc corrélé. Ces deux blocs sont peu corrélés entre eux. Cette redondance sera reprise dans la discussion de l'ACP.*
+
+## Vérifier si les variances sont proches de zéro
+
+```{r}
+nearZeroVar(file_na[4:22], saveMetrics = TRUE)
+```
+
+Aucune variable n'est signalée `nzv = TRUE` : toutes les variables conservent une variabilité suffisante pour être conservées.
+
+# Partie 1. Séparation train/test et validation croisée (étape a)
+
+## Séparer les échantillons d'entraînement et de test
+
+```{r}
+# Split Train/Test
+set.seed(123)
+# On utilise `createDataPartition()` de caret pour stratifier selon la variable
+# qualitative à prédire, car les classes sont déséquilibrées (316 / 84)
+train_idx <- createDataPartition(file_na$druggable, p = 0.75, list = FALSE)
+train_set <- file_na[train_idx, ]
+test_set  <- file_na[-train_idx, ]
+
+# On construit ICI les folds de validation croisée, une seule fois, afin de
+# réutiliser EXACTEMENT le même découpage pour tous les modèles (MLR, CART
+# régression, CART classification) : c'est ce qui rend les comparaisons de
+# performance en CV comparables entre modèles (cf. consigne f).
+# `returnTrain = TRUE` est indispensable : `caret::trainControl(index = ...)`
+# attend des indices D'APPRENTISSAGE, pas des indices de test.
+set.seed(123)
+cv_folds <- createFolds(train_set$druggable, k = 10, returnTrain = TRUE)
+ctrl_cv  <- trainControl(method = "cv", index = cv_folds, savePredictions = "final")
+```
+
+## Mise à l'échelle du test et du train SEPAREMENT
+
+```{r}
+train_set_num <- train_set %>% select(-c(1, 2, 3, 23, 24)) # -PDB_ID,-Ligand_Num,-Score_Drugg,-Shape,-druggable
+train_s  <- scale(train_set_num)
+train_df <- as.data.frame(train_s)
+
+test_set_num <- test_set %>% select(-c(1, 2, 3, 23, 24))
+test_s  <- scale(test_set_num, center = attr(train_s, "scaled:center"), scale = attr(train_s, "scaled:scale"))
+test_df <- as.data.frame(test_s)
+```
+
+```{r}
+df_raw <- train_set_num %>%
+  pivot_longer(cols = everything(), names_to = "Descriptor", values_to = "Value") %>%
+  mutate(Type = "Données brutes (Train set)")
+
+df_scaled <- train_df %>%
+  pivot_longer(cols = everything(), names_to = "Descriptor", values_to = "Value") %>%
+  mutate(Type = "Données standardisées (Train set)")
+
+df_combined <- bind_rows(df_raw, df_scaled)
+
+ggplot(df_combined, aes(x = Descriptor, y = Value, fill = Descriptor)) +
+  geom_boxplot(outlier.size = 1, alpha = 0.8) +
+  facet_wrap(~Type, scales = "free_y") + 
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(size = rel(1), face = "bold", color = "grey20"), 
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+    legend.position = "none",
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey95", color = NA)
+  ) +
+  labs(x = "Descriptors", y = "Value")
+```
+
+## Relation entre chaque descripteur et `Score_Drugg` (sur le TRAIN)
+
+Toutes les analyses exploratoires étant réalisées sur le train, on regarde ici, pour
+chaque descripteur, la forme de sa relation avec `Score_Drugg` : nuage de points +
+lissage `loess` (courbe flexible, en rouge) superposé à la droite de régression
+linéaire (en bleu pointillé). Un écart net entre les deux courbes indique une
+relation non linéaire (mais potentiellement monotone) qu'une régression linéaire
+simple sous-ajusterait.
+
+```{r fig.height=9, fig.width=8}
+descriptors <- names(train_set_num)
+
+long_train <- train_set %>%
+  select(all_of(c(descriptors, "Score_Drugg"))) %>%
+  pivot_longer(cols = all_of(descriptors), names_to = "descriptor", values_to = "value")
+
+ggplot(long_train, aes(x = value, y = Score_Drugg)) +
+  geom_point(alpha = 0.3, size = 0.7) +
+  geom_smooth(method = "loess", se = FALSE, color = "firebrick", linewidth = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "steelblue", linetype = "dashed", linewidth = 0.5) +
+  facet_wrap(~descriptor, scales = "free_x", ncol = 4) +
+  theme_minimal(base_size = 8) +
+  theme(strip.text = element_text(size = 7)) +
+  labs(
+    title = "Score_Drugg vs chaque descripteur (train)",
+    subtitle = "Rouge = loess, bleu pointillé = droite lm — un écart marqué signale une relation non linéaire",
+    x = NULL, y = "Score_Drugg"
+  )
+```
+
+On complète cette lecture visuelle par un indicateur chiffré : l'écart entre la
+corrélation de Pearson (sensible uniquement à la partie *linéaire* de la relation)
+et celle de Spearman (sensible à toute relation *monotone*). Un écart important
+signale une relation monotone mais non linéaire.
+
+```{r}
+cor_compare <- sapply(descriptors, function(v) {
+  x <- train_set[[v]]
+  c(
+    pearson  = cor(x, train_set$Score_Drugg, method = "pearson"),
+    spearman = cor(x, train_set$Score_Drugg, method = "spearman")
+  )
+})
+cor_compare <- as.data.frame(t(cor_compare))
+cor_compare$gap <- abs(cor_compare$spearman - cor_compare$pearson)
+knitr::kable(cor_compare[order(-cor_compare$gap), ], digits = 3,
+             caption = "Corrélation avec Score_Drugg (train), triée par écart Spearman - Pearson")
+```
+
+*Observations :*
+
+# Partie 2. Analyse Non-Supervisée (étapes b et c)
+
+Deux méthodes de classification étudiées :
+
+- classification hiérarchique (CAH)
+- k-means (via `fviz_nbclust`, à titre de comparaison pour le choix du nombre de clusters)
+
+Functions used here: 
+ - `scale()` = normalization of data
+ - `dist()` = distance matrix calculation
+ - `hclust()` = calculation of the classification tree 
+ - `plot()` = graphical representation of the classification tree
+ - `fviz_nbclust`(factoextra) = determination of the optimal number of clusters according to a chosen criterion
+ - `rect.hclust()` = visualization of clusters on the classification tree
+ - `cutree()` = cluster retrieval
+
+## ACP linéaire sur TRAIN 
+
+0. scale data
+1. calculer la matrice de covariance
+2. calculer les valeurs propres
+3. calculer les composantes principales
+4. inverser le signe des vecteurs propres (convention d'affichage)
+5. visualiser
+
+```{r}
+# Le script bb_biplot nécessite un accès internet (source() distant). En cas de
+# réseau restreint, utiliser le fallback factoextra::fviz_pca_biplot ci-dessous.
+bb_biplot_available <- tryCatch({
+  source("https://raw.githubusercontent.com/benbell95/better_biplot/refs/heads/main/r/better_biplot.r")
+  TRUE
+}, error = function(e) FALSE)
+
+pca_res <- prcomp(train_df, scale = TRUE)
+pca_res$rotation <- -1 * pca_res$rotation
+pca_res$x <- -1 * pca_res$x
+head(pca_res$rotation)
+head(pca_res$x)
+
+if (bb_biplot_available) {
+  bb_biplot(pca_res, scale = 0, lab_rotation = TRUE, circle.eq = TRUE, legend = TRUE, title.leg = "Clusters")
+} else {
+  fviz_pca_biplot(pca_res, repel = TRUE, geom.ind = "point",
+                   alpha.ind = 0.4, col.var = "firebrick")
+}
+```
+
+```{r}
+# Screeplot -- part de variance expliquée par composante (aide à choisir combien
+# d'axes retenir pour la suite, notamment pour le clustering)
+fviz_eig(pca_res, addlabels = TRUE)
+```
+
+```{r}
+# On extrait les 3 premières composantes pour la classification hiérarchique
+# avec réechantillonnage bootstrap
+pc_scores <- pca_res$x[, 1:3]
+pc_df <- as.data.frame(pc_scores)
+```
+
+*Observations : qu'est-ce qui est linéaire dans une ACP classique, et quelles en sont
+les conséquences sur les blocs de variables corrélées identifiés plus haut ?*
+
+## ACP non-linéaire sur TRAIN
+```{r}
+kpca_model <- kpca(
+    ~ ., data = train_df,
+    kernel = "rbfdot",
+    kpar = list(sigma = 0.2),
+    features = 3
+)
+
+X_kpca <- as.data.frame(predict(kpca_model, x = train_df))
+colnames(X_kpca) <- c("PC1", "PC2", "PC3")
+
+eigenvals <- eig(kpca_model)
+prop_var <- eigenvals / sum(eigenvals)
+cumsum(prop_var)
+
+ggplot(X_kpca, aes(x = PC1, y = PC2)) +
+    geom_point(alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "Kernel PCA (RBF) sur les 19 descripteurs standardisés")
+```
+
+## Clustering (CAH et/ou k-means) sur TRAIN
+
+### Classification Ascendante Hiérarchique (CAH)
+
+```{r}
+# Sur les scores ACP (données standardisées, sans la colonne druggable)
+pcs.euc <- dist(pc_scores, method = "euclidean")
+```
+
+```{r}
+fviz_nbclust(pc_scores, hcut, method = "silhouette")
+```
+
+```{r}
+# Ward.D2 minimise la variabilité intra-cluster et maximise la variabilité inter-cluster
+pcs_hca <- hclust(pcs.euc, method = "ward.D2")
+
+plot(pcs_hca, hang = -1, cex = 0.4, main = "Dendrogramme (Données standardisées)")
+rect.hclust(pcs_hca, k = 4)
+```
+
+*Observations : le critère de silhouette suggère k = 2, mais le dendrogramme montre
+une structure plus fine à k = 4 (silhouette légèrement plus faible mais coupe
+visuellement plus naturelle). Les deux découpages sont testés ci-dessous via
+bootstrap pour trancher sur la base de la stabilité plutôt que sur la seule
+silhouette.*
+
+```{r}
+pcs.cluster <- cutree(pcs_hca, k = 4)
+pcs_cmds <- cmdscale(pcs.euc)
+
+plot(pcs_cmds, col = pcs.cluster)
+abline(h = 0, v = 0, lty = 2)
+text(pcs_cmds, cex = 0.5, pos = 1, col = pcs.cluster)
+```
+
+```{r}
+group_hclust <- factor(cutree(pcs_hca, k = 2))
+table(group_hclust)
+```
+
+## Bootstrap (stabilité des clusters)
+
+L'idée : si nos clusters constituent une caractéristique réelle des données, ils devraient réapparaître de manière cohérente lors de différents rééchantillonnages. Si un cluster est un artefact dû à quelques points influents, il disparaîtra, fusionnera avec un autre cluster ou sa composition changera en fonction des points rééchantillonnés. Le bootstrap vise à tester la stabilité : « Obtiendrais-je les mêmes clusters avec des données légèrement différentes ? »
+
+`clusterboot()` utilise l'index de Jaccard pour comparer la similitude des clusters de début contre les clusters de rééchantillonnage.
+Un cluster avec un indice de Jaccard moyen d'environ 0,75+ sur 1000 réplicats est considéré comme stable ; en dessous de ~0,5, il est considéré comme fragile/dissous.
+
+```{r}
+set.seed(2004)
+
+cboot_2 <- clusterboot(pc_scores, B = 1000, bootmethod = "boot", clustermethod = hclustCBI, method = "ward.D2", k = 2, count = FALSE)
+cboot_3 <- clusterboot(pc_scores, B = 1000, bootmethod = "boot", clustermethod = hclustCBI, method = "ward.D2", k = 3, count = FALSE)
+cboot_4 <- clusterboot(pc_scores, B = 1000, bootmethod = "boot", clustermethod = hclustCBI, method = "ward.D2", k = 4, count = FALSE)
+```
+
+```{r}
+cat('\nStabilité par cluster, k=2 (plus haut = plus stable):', cboot_2$bootmean,
+    '\nNombre de "dissolutions" sur 1000 réplicats:', cboot_2$bootbrd)
+
+cat('\n\nStabilité par cluster, k=3:', cboot_3$bootmean,
+    '\nNombre de "dissolutions" sur 1000 réplicats:', cboot_3$bootbrd)
+
+cat('\n\nStabilité par cluster, k=4:', cboot_4$bootmean,
+    '\nNombre de "dissolutions" sur 1000 réplicats:', cboot_4$bootbrd)
+```
+
+*Conclusion : on retient la partition à 2 clusters (indice de Jaccard le plus élevé
+et cluster 1 très stable, dissous dans moins de 10% des réplicats). Les partitions
+à 3 et 4 clusters comportent au moins un cluster nettement plus fragile.*
+
+```{r}
+par(mar = c(2, 2, 2, 0))
+plot(cboot_2)
+plot(cboot_4)
+```
+
+# Partie 3. Prédiction quantitative de `Score_Drugg` (étape d)
+
+Régression linéaire multiple de la forme :
+$$Score\_Drugg = \beta_0 + \beta_1 X_1 + \dots + \beta_j X_j$$
+
+1. Sélectionner les descripteurs $X_i$ pertinents par rapport à la variable à prédire ;
+    - `lm()` pour tous les descripteurs pris un par un contre `Score_Drugg` ;
+    - seuls les descripteurs pour lesquels le modèle univarié a une p-value inférieure à un seuil donné sont gardés pour le modèle complet ;
+2. établir le modèle (`Score_Drugg ~ .`) ;
+3. étudier la qualité du modèle via les résidus $e_i = y_i - \hat{y}_i$ :
+    a. distribution normale $e_i \sim \mathcal{N}(0, \sigma^2)$ (histogramme + qqplot) ;
+    b. indépendance des résidus ;
+    c. homoscédasticité (variance constante) ;
+4. valider le modèle par CV (10-fold, mêmes folds que pour CART) puis calculer les performances finales (R², R²adj, RMSE) sur `train` et `test`.
+
+*Contrairement à la version précédente de ce document, cette section utilise
+directement les colonnes réelles du dataset (`Score_Drugg`, `SURFACE_HULL`,
+`C_RESIDUES`, etc.) — les variables `score`, `Real_volume`, `C_ATOM`, `B.factor`,
+`SA` qui apparaissaient ici provenaient d'un tout autre jeu de données et ne
+correspondent à rien dans `train_set`/`test_set`.*
+
+## Préparation des jeux de modélisation
+
+```{r}
+# On retire les identifiants (non predictifs) et la variable qualitative dérivée
+# (druggable), pour ne garder que les 19 descripteurs numériques + Shape en
+# predicteurs de Score_Drugg. On utilise les valeurs BRUTES (non standardisées) :
+# lm() est invariant par changement d'échelle pour l'ajustement et les p-values ;
+# seuls les coefficients changeraient d'unité.
+train_lm_df <- train_set %>% select(-PDB_ID, -Ligand_Num, -druggable)
+test_lm_df  <- test_set  %>% select(-PDB_ID, -Ligand_Num, -druggable)
+```
+
+## a. Présélection univariée des descripteurs
+
+```{r check the significance of var}
+numeric_descriptors <- names(train_lm_df)[names(train_lm_df) != "Score_Drugg" & names(train_lm_df) != "Shape"]
+
+univariate_pval <- sapply(numeric_descriptors, function(v) {
+  mod.lm <- lm(reformulate(v, response = "Score_Drugg"), data = train_lm_df)
+  summary(mod.lm)$coefficients[2, 4]
+})
+
+hist(univariate_pval, main = "P-values des régressions univariées", xlab = "p-value")
+
+# Combien de variables sous le seuil de 0.05 (seuil usuel), et lesquelles
+sum(univariate_pval < 0.05)
+names(univariate_pval)[univariate_pval < 0.05]
+```
+
+```{r}
+# On teste également Shape (facteur à 4 niveaux) via une ANOVA à un facteur
+anova(lm(Score_Drugg ~ Shape, data = train_lm_df))
+```
+
+```{r update train and test set}
+vars_keep <- c(names(univariate_pval)[univariate_pval < 0.05], "Score_Drugg")
+# Shape est ajouté séparément selon le résultat de l'ANOVA ci-dessus (à ajuster
+# après lecture du résultat -- ici on le garde pour pouvoir tester sa significativité
+# dans le modèle complet plutôt que de le retirer trop tôt)
+train_set_mlr <- train_lm_df[, c(vars_keep, "Shape")]
+test_set_mlr  <- test_lm_df[, c(vars_keep, "Shape")]
+```
+
+## b. Modèle complet
+
+```{r LMR}
+mlr1 <- lm(Score_Drugg ~ ., data = train_set_mlr)
+summary(mlr1)
+AIC(mlr1) # plus l'AIC est petit, meilleur est le compromis ajustement/complexité
+```
+
+*Commentez : quelles variables sont significatives ? Le VIF (`car::vif(mlr1)`)
+est-il élevé pour les descripteurs de taille identifiés comme redondants dans la
+matrice de corrélation (Partie 0) ?*
+
+## c. Diagnostic des résidus
+
+```{r graphic representation}
+par(mfrow = c(1, 2))
+hist(mlr1$residuals, main = "Résidus - modèle complet")
+qqnorm(mlr1$residuals, main = "Résidus - modèle complet")
+qqline(mlr1$residuals)
+par(mfrow = c(1, 1))
+```
+
+```{r scatter plot MLR}
+plot(mlr1$fitted.values, mlr1$residuals, main = "Résidus vs valeurs ajustées")
+abline(h = 0, lty = 2)
+```
+
+*Commentez vos résultats. Les résidus ont-ils des propriétés acceptables
+(distribution proche de la normale, pas de structure résiduelle en fonction des
+valeurs ajustées) ? Un nuage en éventail ou en U indiquerait une hétéroscédasticité
+ou une relation non-linéaire non capturée par le modèle -- à recroiser avec les
+graphiques de la Partie 1 (loess vs droite lm) et avec `car::crPlots(mlr1)`.*
+
+## d. Analyse des individus influents
+
+```{r}
+par(mfrow = c(1, 2))
+plot(mlr1, which = 5) # résidus standardisés vs leverage
+plot(mlr1, which = 4) # distance de Cook
+par(mfrow = c(1, 1))
+```
+
+Seuil usuel pour la distance de Cook : $4/n$ (avec $n$ = nombre d'observations du train).
+
+```{r}
+cook_threshold <- 4 / nrow(train_set_mlr)
+influential <- which(cooks.distance(mlr1) > cook_threshold)
+train_set[influential, "PDB_ID"]
+```
+
+## e. Sélection de variables (stepwise AIC)
+
+```{r}
+mlr2 <- step(mlr1, direction = "backward", trace = FALSE)
+summary(mlr2)
+```
+
+*Quel est le modèle final retenu par la procédure descendante basée sur l'AIC ?
+Quelles variables ont été éliminées, et pourquoi (redondance avec un autre
+descripteur du même bloc de corrélation, non-significativité) ?*
+
+## f. Validation croisée (MLR)
+
+```{r}
+# On réutilise EXACTEMENT les mêmes folds (ctrl_cv) que pour les modèles CART,
+# afin que la comparaison finale (Partie 5) soit faite sur des jeux identiques.
+mlr_formula <- formula(mlr2)
+
+set.seed(123)
+mlr_cv <- train(
+  mlr_formula,
+  data = train_set_mlr,
+  method = "lm",
+  trControl = ctrl_cv
+)
+mlr_cv
+```
+
+## g. Performance finale (train / test)
+
+```{r}
+r2adj <- function(r2, n, p) 1 - ((1 - r2) * (n - 1) / (n - p - 1))
+
+mlr2_pred_train <- predict(mlr2, newdata = train_set_mlr)
+mlr2_pred_test  <- predict(mlr2, newdata = test_set_mlr)
+
+p_sel <- length(coef(mlr2)) - 1
+
+perf_mlr_train <- postResample(pred = mlr2_pred_train, obs = train_set_mlr$Score_Drugg)[1:2]
+perf_mlr_train <- c(perf_mlr_train, "Rsquared_adj" = r2adj(perf_mlr_train[["Rsquared"]], nrow(train_set_mlr), p_sel))
+
+perf_mlr_test <- postResample(pred = mlr2_pred_test, obs = test_set_mlr$Score_Drugg)[1:2]
+perf_mlr_test <- c(perf_mlr_test, "Rsquared_adj" = r2adj(perf_mlr_test[["Rsquared"]], nrow(test_set_mlr), p_sel))
+
+perf_mlr <- rbind(train = perf_mlr_train, test = perf_mlr_test)
+knitr::kable(perf_mlr, digits = 3, caption = "Performance du MLR (modèle sélectionné) sur train et test")
+```
+
+```{r}
+lims <- range(c(train_set_mlr$Score_Drugg, test_set_mlr$Score_Drugg))
+par(mfrow = c(1, 2))
+plot(train_set_mlr$Score_Drugg, mlr2_pred_train, xlim = lims, ylim = lims,
+     xlab = "Observé", ylab = "Prédit", main = "MLR - Train", pch = 20, col = rgb(0.2, 0.4, 0.6, 0.5))
+abline(0, 1, lty = 2, col = "red")
+
+plot(test_set_mlr$Score_Drugg, mlr2_pred_test, xlim = lims, ylim = lims,
+     xlab = "Observé", ylab = "Prédit", main = "MLR - Test", pch = 20, col = rgb(0.2, 0.4, 0.6, 0.5))
+abline(0, 1, lty = 2, col = "red")
+par(mfrow = c(1, 1))
+```
+
+*En analysant ces informations, que pensez-vous des performances du modèle ? Y a
+t-il une perte de performance notable entre `train` et `test` (signe de
+sur-ajustement) ?*
+
+# Partie 4. CART (étape e)
+
+## a. CART en régression pour `Score_Drugg`
+
+```{r}
+# Mêmes prédicteurs que pour le MLR (hors sélection de variables : CART fait sa
+# propre sélection via les splits), sur les valeurs BRUTES (CART ne nécessite pas
+# de standardisation, il est invariant aux transformations monotones des prédicteurs).
+data_cart_reg <- train_lm_df   # Score_Drugg + 19 descripteurs + Shape
+data_cart_reg_test <- test_lm_df
+```
+
+```{r}
+set.seed(123)
+cart_reg_cv <- train(
+  Score_Drugg ~ .,
+  data = data_cart_reg,
+  method = "rpart",
+  trControl = ctrl_cv,
+  tuneLength = 10
+)
+cart_reg_cv
+plot(cart_reg_cv)
+```
+
+```{r}
+# Arbre final avec le cp retenu par CV, pour interprétation/visualisation
+cart_reg <- rpart(Score_Drugg ~ ., data = data_cart_reg, method = "anova",
+                   control = rpart.control(cp = cart_reg_cv$bestTune$cp, minsplit = 5))
+rpart.plot(cart_reg, main = "CART régression pour Score_Drugg")
+printcp(cart_reg)
+```
+
+*Quels sont les descripteurs impliqués dans les premiers splits de l'arbre ?
+Sont-ils cohérents avec ceux identifiés comme significatifs dans le MLR (Partie 3) ?*
+
+```{r}
+cart_reg_pred_train <- predict(cart_reg, newdata = data_cart_reg)
+cart_reg_pred_test  <- predict(cart_reg, newdata = data_cart_reg_test)
+
+perf_cart_reg_train <- postResample(pred = cart_reg_pred_train, obs = data_cart_reg$Score_Drugg)[1:2]
+perf_cart_reg_test  <- postResample(pred = cart_reg_pred_test,  obs = data_cart_reg_test$Score_Drugg)[1:2]
+
+perf_cart_reg <- rbind(train = perf_cart_reg_train, test = perf_cart_reg_test)
+knitr::kable(perf_cart_reg, digits = 3, caption = "Performance du CART régression sur train et test")
+```
+
+## b. CART en classification pour `druggable`
+
+**Point important corrigé ici :** le tirage précédent incluait `PDB_ID` parmi les
+prédicteurs. Comme `PDB_ID` est un identifiant unique par poche, l'arbre
+apprend à "reconnaître" chaque ligne individuellement au lieu d'apprendre une
+règle basée sur les descripteurs -- ce qui donnait un arbre trivial (1 split sur
+`PDB_ID`, 100% de bien classés mais totalement non généralisable). On retire donc
+`PDB_ID`, `Ligand_Num` **et** `Score_Drugg` (ce dernier étant à l'origine même de
+`druggable` -- le garder serait une fuite d'information, puisque le modèle
+retrouverait trivialement le seuil à 0.5 utilisé pour construire la cible).
+
+```{r}
+data_cart_class      <- train_set %>% select(-PDB_ID, -Ligand_Num, -Score_Drugg)
+data_cart_class_test <- test_set  %>% select(-PDB_ID, -Ligand_Num, -Score_Drugg)
+```
+
+```{r}
+set.seed(123)
+cart_class_cv <- train(
+  druggable ~ .,
+  data = data_cart_class,
+  method = "rpart",
+  trControl = ctrl_cv,
+  tuneLength = 10,
+  metric = "Accuracy"
+)
+cart_class_cv
+plot(cart_class_cv)
+```
+
+```{r}
+cart_class <- rpart(druggable ~ ., data = data_cart_class, method = "class",
+                     control = rpart.control(cp = cart_class_cv$bestTune$cp, minsplit = 5))
+rpart.plot(cart_class, type = 2, extra = 2, main = "Arbre de décision pour la Druggabilité")
+printcp(cart_class)
+```
+
+```{r}
+# Garde-fou : si le cp retenu par CV élague l'arbre jusqu'à la racine (aucun
+# split), predict(type="prob") renvoie la MÊME probabilité pour toutes les
+# observations. Un ROC ne peut alors rien discriminer (AUC indéfinie). On
+# vérifie ça explicitement avant de tracer la courbe ROC plus bas.
+n_leaves <- sum(cart_class$frame$var == "<leaf>")
+cat("Nombre de feuilles de l'arbre retenu :", n_leaves, "\n")
+if (n_leaves <= 1) {
+  warning("L'arbre n'a aucun split (racine seule) : la CV a jugé qu'aucune ",
+          "variable n'améliore la classification de façon fiable. Essayer un ",
+          "cp plus petit fixé à la main (ex. cp = 0.01) pour forcer quelques ",
+          "splits, à des fins d'illustration -- en gardant à l'esprit que ce ",
+          "serait alors moins bien validé par CV.")
+}
+```
+
+L'argument `extra = 2` précise pour chaque nœud/feuille le taux de classification :
+le nombre de classifications correctes (à gauche du "/") et le nombre
+d'observations dans le nœud (à droite du "/").
+
+*Analysez ce modèle : quels sont les descripteurs impliqués ? Sont-ils cohérents
+avec le CART régression ci-dessus et avec le MLR ?*
+
+### Performance sur train
+
+```{r}
+cart_class_pred_train <- predict(cart_class, newdata = data_cart_class, type = "class")
+cart_class_prob_train <- predict(cart_class, newdata = data_cart_class, type = "prob")[, "Druggable"]
+
+# Diagnostic rapide : combien de valeurs de probabilité distinctes le modèle
+# produit-il ? Un arbre à 1 seule feuille en produit une seule -> ROC dégénérée.
+cat("Valeurs de probabilité distinctes (train) :", length(unique(cart_class_prob_train)), "\n")
+print(table(round(cart_class_prob_train, 3)))
+
+(conf_cart_train <- confusionMatrix(data = cart_class_pred_train,
+                                     reference = data_cart_class$druggable,
+                                     positive = "Druggable"))
+
+# `pROC::` explicite : avec 17 packages chargés en début de document, il n'est
+# pas rare qu'un autre package masque `roc()` (le message d'avertissement
+# habituel est ici invisible car `execute: message: false` dans l'en-tête YAML
+# le supprime). Appeler la fonction en pleine résolution évite ce piège.
+if (length(unique(cart_class_prob_train)) > 1) {
+  roc_cart_train <- pROC::roc(data_cart_class$druggable, cart_class_prob_train, levels = c("NonDruggable", "Druggable"), direction = "<")
+  plot(roc_cart_train, main = "ROC - CART classification (train)")
+} else {
+  message("Prédicteur constant sur le train : courbe ROC non tracée (voir note ci-dessus).")
+}
+```
+
+### Performance sur test
+
+```{r}
+cart_class_pred_test <- predict(cart_class, newdata = data_cart_class_test, type = "class")
+cart_class_prob_test <- predict(cart_class, newdata = data_cart_class_test, type = "prob")[, "Druggable"]
+
+(conf_cart_test <- confusionMatrix(data = cart_class_pred_test,
+                                    reference = data_cart_class_test$druggable,
+                                    positive = "Druggable"))
+
+if (length(unique(cart_class_prob_test)) > 1) {
+  roc_cart_test <- pROC::roc(data_cart_class_test$druggable, cart_class_prob_test, levels = c("NonDruggable", "Druggable"), direction = "<")
+  plot(roc_cart_test, main = "ROC - CART classification (test)")
+}
+```
+
+```{r}
+if (exists("roc_cart_train") && exists("roc_cart_test")) {
+  plot(roc_cart_train, col = "red", main = "ROC - CART classification")
+  lines(roc_cart_test, col = "darkgreen")
+  legend("bottomright", legend = c("train", "test"), col = c("red", "darkgreen"), lty = 1, bty = "n")
+}
+```
+
+*Y a-t-il une perte de performance entre `train` et `test` ? Le déséquilibre des
+classes (316 vs 84) affecte-t-il la sensibilité/spécificité ?*
+
+# Partie 5. Régression logistique (extra)
+
+*Cette section est une extension : elle n'est pas obligatoire selon les consignes
+transmises cette année, mais est incluse ici pour aller plus loin, sur le même
+principe qu'un modèle glm binomial vs le MLR (comparaison "linéaire" pour les deux
+formulations quantitative/qualitative du problème).*
+
+On modélise ici `druggable` (et non plus `Score_Drugg`) par régression logistique :
+$$\text{logit}(P(druggable = \text{Druggable})) = \beta_0 + \beta_1 X_1 + \dots + \beta_j X_j$$
+
+On réutilise `data_cart_class` (déjà construit en Partie 4.b : `train_set` sans
+`PDB_ID`, `Ligand_Num` ni `Score_Drugg` -- ce dernier étant retiré pour la même
+raison que pour le CART classification : le garder serait une fuite d'information
+puisque `druggable` en est directement dérivé).
+
+## a. Présélection univariée des descripteurs
+
+Même logique que pour le MLR (Partie 3.a), mais avec `glm(family = "binomial")`
+à la place de `lm()`, puisque la cible est ici qualitative.
+
+```{r}
+data_cart_class_num_desc <- names(data_cart_class)[!(names(data_cart_class) %in% c("druggable", "Shape"))]
+
+univariate_pval_glm <- sapply(data_cart_class_num_desc, function(v) {
+  mod.glm <- glm(reformulate(v, response = "druggable"), data = data_cart_class, family = "binomial")
+  summary(mod.glm)$coefficients[2, 4]
+})
+
+hist(univariate_pval_glm, main = "P-values des régressions logistiques univariées", xlab = "p-value")
+
+sum(univariate_pval_glm < 0.05)
+names(univariate_pval_glm)[univariate_pval_glm < 0.05]
+```
+
+```{r}
+anova(glm(druggable ~ Shape, data = data_cart_class, family = "binomial"), test = "Chisq")
+```
+
+```{r}
+vars_keep_glm <- c(names(univariate_pval_glm)[univariate_pval_glm < 0.05], "Shape", "druggable")
+train_set_glm <- data_cart_class[, vars_keep_glm]
+test_set_glm  <- data_cart_class_test[, vars_keep_glm]
+```
+
+## b. Modèle complet et sélection de variables
+
+```{r}
+mlog1 <- glm(druggable ~ ., data = train_set_glm, family = "binomial")
+summary(mlog1)
+```
+
+*Que représentent la déviance nulle et la déviance résiduelle ? Que représente
+l'AIC dans ce contexte (même principe que pour le MLR, mais basé sur la
+vraisemblance binomiale plutôt que sur la somme des carrés des résidus) ?*
+
+```{r}
+mlog2 <- step(mlog1, direction = "backward", trace = FALSE)
+summary(mlog2)
+```
+
+## c. Validation croisée (régression logistique)
+
+```{r}
+# On réutilise les MÊMES folds que pour le MLR et les deux CART (ctrl_cv_class
+# ajoute simplement classProbs + une métrique ROC, sur le même découpage).
+ctrl_cv_class <- trainControl(method = "cv", index = cv_folds, savePredictions = "final",
+                               classProbs = TRUE, summaryFunction = twoClassSummary)
+
+set.seed(123)
+mlog_cv <- train(
+  formula(mlog2),
+  data = train_set_glm[-15],
+  method = "glm",
+  family = "binomial",
+  trControl = ctrl_cv_class,
+  metric = "ROC"
+)
+mlog_cv
+```
+
+## d. Performance sur train et test
+
+```{r}
+mlog_pred_train <- predict(mlog2, newdata = train_set_glm, type = "response")
+mlog_pred_test  <- predict(mlog2, newdata = test_set_glm, type = "response")
+
+hist(mlog_pred_train, main = "Probabilités prédites (train)", xlab = "P(Druggable)")
+```
+
+Seuil par défaut = 0.5 :
+
+```{r}
+seuil <- 0.5
+mlog_class_train <- factor(ifelse(mlog_pred_train > seuil, "Druggable", "NonDruggable"),
+                            levels = levels(train_set_glm$druggable))
+mlog_class_test  <- factor(ifelse(mlog_pred_test > seuil, "Druggable", "NonDruggable"),
+                            levels = levels(test_set_glm$druggable))
+
+(conf_mlog_train <- confusionMatrix(data = mlog_class_train, reference = train_set_glm$druggable, positive = "Druggable"))
+(conf_mlog_test  <- confusionMatrix(data = mlog_class_test,  reference = test_set_glm$druggable,  positive = "Druggable"))
+```
+
+```{r}
+roc_mlog_train <- pROC::roc(train_set_glm$druggable, mlog_pred_train, levels = c("NonDruggable", "Druggable"), direction = "<")
+roc_mlog_test  <- pROC::roc(test_set_glm$druggable,  mlog_pred_test,  levels = c("NonDruggable", "Druggable"), direction = "<")
+
+plot(roc_mlog_train, col = "red", main = "ROC - Régression logistique")
+lines(roc_mlog_test, col = "darkgreen")
+legend("bottomright", legend = c("train", "test"), col = c("red", "darkgreen"), lty = 1, bty = "n")
+```
+
+## e. Seuil optimal
+
+```{r}
+best_seuil_mlog <- pROC::coords(roc_mlog_train, "best", "threshold")
+best_seuil_mlog
+```
+
+```{r}
+seuil_opt <- best_seuil_mlog$threshold
+mlog_class_train_opt <- factor(ifelse(mlog_pred_train > seuil_opt, "Druggable", "NonDruggable"),
+                                levels = levels(train_set_glm$druggable))
+mlog_class_test_opt  <- factor(ifelse(mlog_pred_test > seuil_opt, "Druggable", "NonDruggable"),
+                                levels = levels(test_set_glm$druggable))
+
+confusionMatrix(data = mlog_class_train_opt, reference = train_set_glm$druggable, positive = "Druggable")
+confusionMatrix(data = mlog_class_test_opt,  reference = test_set_glm$druggable,  positive = "Druggable")
+```
+
+*Le seuil optimal (au sens de la distance au coin (0,1) de la courbe ROC) déplace-
+t-il beaucoup le compromis sensibilité/spécificité par rapport au seuil 0.5, étant
+donné le déséquilibre des classes (316 vs 84) ?*
+
+# Partie 6. Évaluation finale et comparaison (étape f)
+
+## a. Prédiction quantitative : CART régression vs MLR
+
+```{r}
+comparaison_quanti <- data.frame(
+  Modele = c("MLR (sélectionné)", "CART régression"),
+  RMSE_CV = c(min(mlr_cv$results$RMSE), min(cart_reg_cv$results$RMSE)),
+  Rsquared_CV = c(max(mlr_cv$results$Rsquared), max(cart_reg_cv$results$Rsquared)),
+  RMSE_test = c(perf_mlr_test[["RMSE"]], perf_cart_reg_test[["RMSE"]]),
+  Rsquared_test = c(perf_mlr_test[["Rsquared"]], perf_cart_reg_test[["Rsquared"]])
+)
+knitr::kable(comparaison_quanti, digits = 3,
+             caption = "Comparaison MLR / CART régression : validation croisée (train) et jeu test")
+```
+
+*Discussion : quel modèle généralise le mieux (écart CV -> test) ? Le MLR est-il
+pénalisé par la non-linéarité identifiée en Partie 1, ou au contraire CART
+sur-apprend-il (arbre trop profond malgré le choix de cp par CV) ?*
+
+## a2. Prédiction qualitative : CART classification vs régression logistique
+
+```{r}
+comparaison_quali <- data.frame(
+  Modele = c("Régression logistique (sélectionnée)", "CART classification"),
+  AUC_CV = c(max(mlog_cv$results$ROC), if (exists("cart_class_cv")) NA_real_ else NA_real_),
+  Accuracy_test = c(conf_mlog_test$overall[["Accuracy"]], conf_cart_test$overall[["Accuracy"]]),
+  Sensitivity_test = c(conf_mlog_test$byClass[["Sensitivity"]], conf_cart_test$byClass[["Sensitivity"]]),
+  Specificity_test = c(conf_mlog_test$byClass[["Specificity"]], conf_cart_test$byClass[["Specificity"]])
+)
+knitr::kable(comparaison_quali, digits = 3,
+             caption = "Comparaison régression logistique / CART classification (jeu test)")
+```
+
+*Note : l'AUC en CV du CART classification n'est directement comparable que si sa
+propre validation croisée (Partie 4.b) est relancée avec `ctrl_cv_class` et
+`metric = "ROC"` au lieu de `ctrl_cv`/`Accuracy` -- à faire si vous voulez ce
+chiffre dans le tableau plutôt qu'un NA.*
+
+## b. Prédiction quantitative vs prédiction qualitative
+
+Le CART régression et le MLR répondent à la même question quantitative
+(`Score_Drugg`), tandis que le CART classification répond à la question
+qualitative (`druggable`, obtenue en seuillant `Score_Drugg` à 0.5). Une bonne
+prédiction quantitative (faible RMSE, `Score_Drugg` prédit proche de la vraie
+valeur) devrait, une fois seuillée à 0.5, conduire à une bonne classification --
+c'est ce qu'on vérifie ci-dessous en comparant la classification obtenue en
+seuillant les prédictions **quantitatives** du CART régression à celle du CART
+**classification** direct.
+
+```{r}
+cart_reg_derived_class_test <- factor(
+  ifelse(cart_reg_pred_test > 0.5, "Druggable", "NonDruggable"),
+  levels = levels(data_cart_class_test$druggable)
+)
+
+confusionMatrix(data = cart_reg_derived_class_test,
+                reference = data_cart_class_test$druggable,
+                positive = "Druggable")
+```
+
+*Comparez cette matrice de confusion à celle du CART classification direct
+(Partie 4.b, sur test). Les deux approches sont-elles globalement cohérentes ? Où
+diffèrent-elles (poches proches du seuil 0.5, notamment) -- et qu'est-ce que cela
+nous apprend sur ce que chaque formulation du problème apporte respectivement
+(le score quantitatif donne une marge de confiance que la classification binaire
+ne donne pas) ?*
+
+## c. Croisement avec l'analyse non supervisée
+
+*Discussion à compléter : les clusters identifiés en Partie 2 (CAH + bootstrap,
+k = 2 retenu) recoupent-ils la variable `druggable` ou les prédictions du CART
+régression ? Les blocs de variables redondantes identifiés dans la matrice de
+corrélation (Partie 0) et dans l'ACP linéaire (Partie 2) se retrouvent-ils parmi
+les variables sélectionnées par le MLR (Partie 3) et par les splits du CART
+(Partie 4) ?*
+
+```{r}
+table(cluster = group_hclust, druggable = train_set$druggable)
+```
+
+# Annexes {.appendix}
+
+## Code complet
+
+```{{r all-code, ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}}
+```
